@@ -11,7 +11,7 @@ class PaymentSettings(BaseSettings):
 
     flutterwave_client_id: str
     flutterwave_client_secret: str
-    flutterwave_encryption_key: str
+    flutterwave_encryption_key: str = ""
     flutterwave_environment: Literal["sandbox", "production"] = "sandbox"
     flutterwave_webhook_secret: str = ""
 

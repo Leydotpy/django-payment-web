@@ -87,6 +87,8 @@ class PaymentProcessor:
             attempt.response_payload = response.raw
             attempt.completed_at = timezone.now()
             attempt.save(update_fields=["status", "response_payload", "completed_at"])
+            if charge_id:
+                queue_message("payments.verification.requested", {"intent_id": str(intent.id)}, reference=locked.reference)
 
         if charge_id and provider_status in {"successful", "success", "succeeded", "completed", "failed"}:
             return self.verify_intent(intent_id=str(intent.id))
@@ -154,9 +156,34 @@ class PaymentProcessor:
                 )
                 queue_message(event.event_type, event.model_dump(mode="json"), reference=locked.reference)
             else:
-                locked.status = PaymentStatus.PROCESSING
+                if locked.status != PaymentStatus.REQUIRES_ACTION:
+                    locked.status = PaymentStatus.PROCESSING
                 locked.save()
             return locked
+
+    def reconcile_intent(self, *, intent_id: str) -> PaymentIntent:
+        """Recover a provider charge ID after a timed-out create, then verify the result."""
+        intent = PaymentIntent.objects.get(pk=intent_id)
+        if intent.status in {PaymentStatus.SUCCEEDED, PaymentStatus.CANCELLED}:
+            return intent
+        if not intent.provider_charge_id:
+            response = get_flutterwave_client().charges.list(reference=intent.reference)
+            matches = [
+                item for item in response.data
+                if str(item.get("reference") or item.get("tx_ref") or "") == intent.reference
+                and item.get("id")
+            ]
+            if len(matches) > 1:
+                raise RuntimeError("Multiple provider charges share the payment reference; review required.")
+            if len(matches) == 1:
+                with transaction.atomic():
+                    locked = PaymentIntent.objects.select_for_update().get(pk=intent.id)
+                    if not locked.provider_charge_id:
+                        locked.provider_charge_id = str(matches[0].get("id"))
+                        locked.save(update_fields=["provider_charge_id", "updated_at"])
+            else:
+                return intent
+        return self.verify_intent(intent_id=str(intent.id))
 
     def process_webhook(self, *, provider_event_id: str) -> None:
         """Consume a signed webhook inbox record and independently verify its payment."""
