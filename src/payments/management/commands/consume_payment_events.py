@@ -28,9 +28,17 @@ async def run_consumer() -> None:
             provider_event_id=event_id
         )
 
+    @bridge.on("payments.verification.requested")
+    async def handle_verification(delivery):
+        intent_id = str(delivery.message["intent_id"])
+        await sync_to_async(PaymentProcessor().verify_intent, thread_sensitive=True)(
+            intent_id=intent_id
+        )
+
     async with get_broker() as broker:
         await broker.subscribe("payments.charge.requested", bridge.dispatch_delivery)
         await broker.subscribe("payments.webhook.received", bridge.dispatch_delivery)
+        await broker.subscribe("payments.verification.requested", bridge.dispatch_delivery)
         await asyncio.Event().wait()
 
 
