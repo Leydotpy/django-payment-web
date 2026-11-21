@@ -20,6 +20,7 @@ INSTALLED_APPS = [
     "graphene_django",
     "django_celery_results",
     "payments.apps.PaymentsConfig",
+    "broka.integrations.django",
 ]
 
 MIDDLEWARE = [
