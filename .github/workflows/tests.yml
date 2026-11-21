@@ -1,0 +1,47 @@
+name: Payment service tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: payments
+          POSTGRES_PASSWORD: payments
+          POSTGRES_DB: payments
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U payments"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DJANGO_SETTINGS_MODULE: config.settings
+      DJANGO_SECRET_KEY: ci-only
+      PYTHONPATH: src
+      POSTGRES_DB: payments
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_HOST: localhost
+      PAYMENTS_FLUTTERWAVE_CLIENT_ID: sandbox-test
+      PAYMENTS_FLUTTERWAVE_CLIENT_SECRET: sandbox-test
+      PAYMENTS_FLUTTERWAVE_WEBHOOK_SECRET: sandbox-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install project integrations
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "django>=6.1" djangorestframework graphene-django celery pydantic-settings "psycopg[binary]" pytest pytest-django
+          python -m pip install "git+https://github.com/Leydotpy/pyev.git@main"
+          python -m pip install "git+https://github.com/Leydotpy/pyev-dispatch.git@main"
+          python -m pip install "git+https://github.com/Leydotpy/flutterwave_sdk.git@fix/sdk-security-and-packaging"
+      - name: Check and migrate
+        run: |
+          python src/manage.py check
+          python src/manage.py migrate --noinput
+      - name: Test
+        run: python -m pytest -q tests

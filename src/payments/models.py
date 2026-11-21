@@ -132,4 +132,4 @@ class AuthorizedPaymentMethod(models.Model):
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
-        indexes = [models.Index(fields=["owner", "is_active"])]
+        indexes = [models.Index(fields=["owner", "is_active"], name="payments_ap_owner_active_idx")]
