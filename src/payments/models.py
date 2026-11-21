@@ -3,7 +3,9 @@ from __future__ import annotations
 import uuid
 from decimal import Decimal
 
+from django.conf import settings
 from django.db import models
+from broka.integrations.django.models import AbstractOutboxRecord
 from django.utils import timezone
 
 
@@ -15,6 +17,7 @@ class PaymentStatus(models.TextChoices):
     SUCCEEDED = "succeeded", "Succeeded"
     FAILED = "failed", "Failed"
     CANCELLED = "cancelled", "Cancelled"
+    VERIFICATION_FAILED = "verification_failed", "Verification failed"
 
 
 class Provider(models.TextChoices):
@@ -30,6 +33,7 @@ class PaymentIntent(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     reference = models.CharField(max_length=128, unique=True, db_index=True)
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.PROTECT, related_name="payment_intents")
     provider = models.CharField(max_length=32, choices=Provider.choices, default=Provider.FLUTTERWAVE)
     amount = models.DecimalField(max_digits=14, decimal_places=2)
     currency = models.CharField(max_length=3)
@@ -42,6 +46,9 @@ class PaymentIntent(models.Model):
     provider_charge_id = models.CharField(max_length=128, blank=True, default="", db_index=True)
     next_action = models.JSONField(default=dict, blank=True)
     last_provider_response = models.JSONField(default=dict, blank=True)
+    provider_status = models.CharField(max_length=64, blank=True, default="")
+    verification_payload = models.JSONField(default=dict, blank=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
     failure_code = models.CharField(max_length=128, blank=True, default="")
     failure_message = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
@@ -103,3 +110,11 @@ class OutboxEvent(models.Model):
     @property
     def is_published(self) -> bool:
         return self.published_at is not None
+
+
+class PaymentOutboxRecord(AbstractOutboxRecord):
+    """Application-owned persistent Broka outbox. Stored in the same DB transaction as payments."""
+
+    class Meta:
+        db_table = "payments_broka_outbox"
+        ordering = ("available_at", "created_at", "id")

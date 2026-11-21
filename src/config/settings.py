@@ -19,6 +19,7 @@ INSTALLED_APPS = [
     "graphene_django",
     "django_celery_results",
     "payments.apps.PaymentsConfig",
+    "broka.integrations.django",
 ]
 
 MIDDLEWARE = [
@@ -80,3 +81,16 @@ CELERY_TASK_ACKS_LATE = True
 CELERY_TASK_REJECT_ON_WORKER_LOST = True
 CELERY_TASK_TIME_LIMIT = 90
 CELERY_TASK_SOFT_TIME_LIMIT = 75
+
+# Broka owns transport, retries and outbox delivery; Django owns payment state.
+# Use a durable external engine in production (RabbitMQ, Kafka or Redis Streams).
+PYEV = {
+    "engine": os.environ.get("PAYMENTS_EVENT_ENGINE", "rabbitmq"),
+    "source": "payment-service",
+    "engines": {
+        "rabbitmq": {"url": os.environ.get("PAYMENTS_RABBITMQ_URL", CELERY_BROKER_URL)},
+    },
+    "django": {
+        "outbox_store": "payments.events.outbox_store",
+    },
+}
