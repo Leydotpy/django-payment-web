@@ -45,7 +45,7 @@ class PaymentProcessor:
 
         try:
             response = get_flutterwave_client().charges.create(
-                amount=float(command.amount),
+                amount=command.amount,
                 currency=command.currency,
                 reference=command.reference,
                 customer_id=command.customer_id,
