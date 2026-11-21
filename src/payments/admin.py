@@ -29,3 +29,12 @@ class PaymentEventAdmin(admin.ModelAdmin):
 class OutboxEventAdmin(admin.ModelAdmin):
     list_display = ("topic", "key", "attempts", "published_at", "created_at")
     list_filter = ("topic", "published_at")
+
+
+from .models import AuthorizedPaymentMethod
+
+@admin.register(AuthorizedPaymentMethod)
+class AuthorizedPaymentMethodAdmin(admin.ModelAdmin):
+    list_display = ("owner", "provider_customer_id", "provider_payment_method_id", "is_active", "verified_at")
+    search_fields = ("provider_payment_method_id", "consent_reference")
+    list_filter = ("is_active",)
