@@ -30,6 +30,7 @@ separate processes.
 
 ```sh
 python src/manage.py migrate
+python src/manage.py pyev_outbox list    # inspect queued messages
 python src/manage.py dispatch_payment_outbox
 python src/manage.py consume_payment_events
 # Schedule periodic reconciliation independently:
@@ -85,3 +86,7 @@ attempt.
 - Payment attempts and provider responses require a retention/redaction policy.
 - Sandbox integration, security/PCI review, provider contract testing, and operational
   drills remain mandatory before production use.
+
+Broka's optional Django application is enabled to expose its built-in system checks and
+`pyev_outbox`, `pyev_health`, and dead-letter inspection commands. Until the associated
+Broka namespace fix is released, install its `fix/django-app-module-namespace` branch.
