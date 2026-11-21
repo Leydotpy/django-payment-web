@@ -1,103 +1,58 @@
+"""GraphQL payments access is explicitly scoped to the authenticated owner."""
 from __future__ import annotations
 
 import graphene
 from graphene.types.generic import GenericScalar
-from django.db import transaction
 from graphene_django import DjangoObjectType
+from graphql import GraphQLError
 
-from ..adapters.broker import get_command_bus
 from ..models import PaymentIntent
-from ..schemas import CardChargeCommand
-from ..settings import get_payment_settings
-from ..tasks import process_card_charge
+from ..usecases import PaymentConflict, create_payment_charge
+
+
+def require_user(info):
+    user = info.context.user
+    if not user.is_authenticated:
+        raise GraphQLError("Authentication is required.")
+    return user
 
 
 class PaymentIntentType(DjangoObjectType):
     class Meta:
         model = PaymentIntent
         fields = (
-            "id",
-            "reference",
-            "provider",
-            "amount",
-            "currency",
-            "status",
-            "metadata",
-            "redirect_url",
-            "provider_charge_id",
-            "next_action",
-            "failure_code",
-            "failure_message",
-            "created_at",
-            "updated_at",
+            "id", "reference", "provider", "amount", "currency", "status",
+            "metadata", "redirect_url", "provider_charge_id", "provider_status",
+            "verified_at", "next_action", "failure_code", "failure_message",
+            "created_at", "updated_at",
         )
 
 
-class CustomerInput(graphene.InputObjectType):
-    email = graphene.String(required=True)
-    name = GenericScalar()
-    phone = GenericScalar()
-    address = GenericScalar()
-
-
-class EncryptedCardInput(graphene.InputObjectType):
-    nonce = graphene.String(required=True)
-    encrypted_card_number = graphene.String(required=True)
-    encrypted_expiry_month = graphene.String(required=True)
-    encrypted_expiry_year = graphene.String(required=True)
-    encrypted_cvv = graphene.String(required=True)
-
-
-class RequestCardCharge(graphene.Mutation):
+class RequestCharge(graphene.Mutation):
     class Arguments:
         reference = graphene.String(required=True)
         amount = graphene.Decimal(required=True)
         currency = graphene.String(required=True)
-        customer = CustomerInput(required=True)
-        encrypted_card = EncryptedCardInput(required=True)
-        redirect_url = graphene.String()
+        customer_id = graphene.String(required=True)
+        payment_method_id = graphene.String(required=True)
         metadata = GenericScalar()
-        scenario_key = graphene.String()
+        redirect_url = graphene.String()
 
     payment_intent = graphene.Field(PaymentIntentType)
 
     @classmethod
     def mutate(cls, root, info, **kwargs):
-        customer = dict(kwargs["customer"])
-        encrypted_card = dict(kwargs["encrypted_card"])
-        metadata = kwargs.get("metadata") or {}
-        with transaction.atomic():
-            intent, created = PaymentIntent.objects.get_or_create(
-                reference=kwargs["reference"],
-                defaults={
-                    "amount": kwargs["amount"],
-                    "currency": kwargs["currency"].upper(),
-                    "customer": customer,
-                    "metadata": metadata,
-                    "redirect_url": kwargs.get("redirect_url") or "",
-                },
+        user = require_user(info)
+        try:
+            intent = create_payment_charge(
+                owner=user, reference=kwargs["reference"], amount=kwargs["amount"],
+                currency=kwargs["currency"], customer_id=kwargs["customer_id"],
+                payment_method_id=kwargs["payment_method_id"],
+                metadata=kwargs.get("metadata"), redirect_url=kwargs.get("redirect_url") or "",
             )
-            if created:
-                intent.mark_queued()
-
-        command = CardChargeCommand(
-            intent_id=intent.id,
-            reference=intent.reference,
-            amount=intent.amount,
-            currency=intent.currency,
-            customer=customer,
-            encrypted_card=encrypted_card,
-            redirect_url=kwargs.get("redirect_url"),
-            metadata=metadata,
-            scenario_key=kwargs.get("scenario_key"),
-        )
-        payload = command.model_dump(mode="json")
-        settings = get_payment_settings()
-        if settings.broker_backend == "celery":
-            process_card_charge.delay(payload)
-        else:
-            get_command_bus().publish(key=intent.reference, payload=payload)
-        return RequestCardCharge(payment_intent=intent)
+        except PaymentConflict as exc:
+            raise GraphQLError(str(exc)) from exc
+        return RequestCharge(payment_intent=intent)
 
 
 class Query(graphene.ObjectType):
@@ -105,17 +60,20 @@ class Query(graphene.ObjectType):
     payment_intents = graphene.List(PaymentIntentType, status=graphene.String())
 
     def resolve_payment_intent(root, info, id):
-        return PaymentIntent.objects.get(id=id)
+        user = require_user(info)
+        qs = PaymentIntent.objects.all() if user.is_staff else PaymentIntent.objects.filter(owner=user)
+        return qs.filter(id=id).first()
 
     def resolve_payment_intents(root, info, status=None):
-        queryset = PaymentIntent.objects.all().order_by("-created_at")
+        user = require_user(info)
+        qs = PaymentIntent.objects.all() if user.is_staff else PaymentIntent.objects.filter(owner=user)
         if status:
-            queryset = queryset.filter(status=status)
-        return queryset[:100]
+            qs = qs.filter(status=status)
+        return qs.order_by("-created_at")[:100]
 
 
 class Mutation(graphene.ObjectType):
-    request_card_charge = RequestCardCharge.Field()
+    request_charge = RequestCharge.Field()
 
 
 schema = graphene.Schema(query=Query, mutation=Mutation)

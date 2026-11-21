@@ -1,132 +1,101 @@
+"""Payment API. Untrusted webhooks enter a durable inbox; verified status is domain-owned."""
 from __future__ import annotations
 
-import json
+import hashlib
+from decimal import Decimal
+
 from django.db import transaction
-from django.utils import timezone
 from flutterwave_sdk import Webhook
 from flutterwave_sdk.webhook import WebhookSignatureError
-from rest_framework import mixins, status, viewsets
+from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.decorators import action
-from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
-from rest_framework.response import Response
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .serializers import CreateCardChargeSerializer, PaymentIntentSerializer
-from ..adapters.broker import get_command_bus
-from ..models import PaymentEvent, PaymentStatus
-from ..models import PaymentIntent
-from ..schemas import CardChargeCommand
+from ..domain import PaymentProcessor
+from ..events import queue_message
+from ..models import PaymentEvent, PaymentIntent
 from ..settings import get_payment_settings
-from ..tasks import process_card_charge
+from ..usecases import PaymentConflict, create_payment_charge
+from .serializers import CreateChargeSerializer, PaymentIntentSerializer
 
 
 class PaymentIntentViewSet(mixins.RetrieveModelMixin, mixins.ListModelMixin, viewsets.GenericViewSet):
-    queryset = PaymentIntent.objects.all().order_by("-created_at")
     serializer_class = PaymentIntentSerializer
     lookup_field = "id"
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = PaymentIntent.objects.all().order_by("-created_at")
+        return queryset if self.request.user.is_staff else queryset.filter(owner=self.request.user)
+
+    @action(detail=False, methods=["post"], url_path="charge")
+    def charge(self, request: Request) -> Response:
+        serializer = CreateChargeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            intent = create_payment_charge(
+                owner=request.user, reference=data["reference"], amount=Decimal(data["amount"]),
+                currency=data["currency"], customer_id=data["customer_id"],
+                payment_method_id=data["payment_method_id"],
+                metadata=data.get("metadata"), redirect_url=data.get("redirect_url", ""),
+            )
+        except PaymentConflict as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response(PaymentIntentSerializer(intent).data, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=False, methods=["post"], url_path="card-charge")
     def card_charge(self, request: Request) -> Response:
-        serializer = CreateCardChargeSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-
-        with transaction.atomic():
-            intent, created = PaymentIntent.objects.get_or_create(
-                reference=data["reference"],
-                defaults={
-                    "amount": data["amount"],
-                    "currency": data["currency"],
-                    "customer": data["customer"],
-                    "metadata": data.get("metadata", {}),
-                    "redirect_url": data.get("redirect_url", ""),
-                },
-            )
-            if created:
-                intent.mark_queued()
-
-        command = CardChargeCommand(
-            intent_id=intent.id,
-            reference=intent.reference,
-            amount=intent.amount,
-            currency=intent.currency,
-            customer=data["customer"],
-            encrypted_card=data["encrypted_card"],
-            redirect_url=data.get("redirect_url") or None,
-            metadata=data.get("metadata", {}),
-            scenario_key=data.get("scenario_key") or None,
+        return Response(
+            {"detail": "Direct card payloads are disabled. Tokenize or host the card with the payment provider, then POST to /charge/."},
+            status=status.HTTP_410_GONE,
         )
-        payload = command.model_dump(mode="json")
-
-        settings = get_payment_settings()
-        if settings.broker_backend == "celery":
-            process_card_charge.delay(payload)
-        else:
-            get_command_bus().publish(key=intent.reference, payload=payload)
-
-        return Response(PaymentIntentSerializer(intent).data, status=status.HTTP_202_ACCEPTED)
 
     @action(detail=True, methods=["post"], url_path="verify")
-    def verify(self, request, id=None):
+    def verify(self, request: Request, id=None) -> Response:
         intent = self.get_object()
-
-        verified = PaymentProcessor().verify_intent(
-            intent_id=str(intent.id),
-            provider_charge_id=request.data.get("provider_charge_id") or None,
-        )
-
+        try:
+            verified = PaymentProcessor().verify_intent(intent_id=str(intent.id))
+        except Exception:
+            return Response({"detail": "Payment verification is temporarily unavailable."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
         return Response(PaymentIntentSerializer(verified).data)
 
 
 class FlutterwaveWebhookView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [permissions.AllowAny]
     authentication_classes: list[type] = []
 
     def post(self, request: Request) -> Response:
-        settings = get_payment_settings()
+        secret = get_payment_settings().flutterwave_webhook_secret
+        if not secret:
+            return Response({"detail": "Webhook verification is not configured."}, status=503)
         try:
-            event = Webhook.construct_event(
-                payload=request.body,
-                headers={key: value for key, value in request.headers.items()},
-                secret_hash=settings.flutterwave_webhook_secret,
+            signed = Webhook.construct_event(
+                payload=request.body, headers=dict(request.headers),
+                secret_hash=secret, allow_legacy_verif_hash=False,
             )
-        except WebhookSignatureError as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except WebhookSignatureError:
+            return Response({"detail": "Invalid webhook signature."}, status=400)
 
-        payload = event.to_dict()
-        event_id = str(payload.get("webhook_id") or payload.get("id") or payload.get("event_id"))
-        event_type = str(payload.get("event") or payload.get("type") or payload.get("event_type"))
-        payment_event, created = PaymentEvent.objects.get_or_create(
-            provider_event_id=event_id,
-            defaults={"event_type": event_type, "payload": payload},
-        )
-        if created:
-            self._apply_event(payload)
-            payment_event.processed_at = timezone.now()
-            payment_event.save(update_fields=["processed_at"])
-        return Response({"received": True})
-
-    def _apply_event(self, payload: dict[str, object]) -> None:
+        payload = signed.to_dict()
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        reference = str(data.get("reference", "")) if isinstance(data, dict) else ""
-        provider_charge_id = str(data.get("id", "")) if isinstance(data, dict) else ""
-        provider_status = str(data.get("status", "")).lower() if isinstance(data, dict) else ""
-        if not reference and not provider_charge_id:
-            return
-        queryset = PaymentIntent.objects.all()
-        if reference:
-            queryset = queryset.filter(reference=reference)
-        else:
-            queryset = queryset.filter(provider_charge_id=provider_charge_id)
-        intent = queryset.first()
-        if not intent:
-            return
-        intent.last_provider_response = payload
-        if provider_status in {"successful", "success", "succeeded", "completed"}:
-            intent.status = PaymentStatus.SUCCEEDED
-        elif provider_status in {"failed", "cancelled", "canceled"}:
-            intent.status = PaymentStatus.FAILED
-        intent.save(update_fields=["status", "last_provider_response", "updated_at"])
+        reference = str(data.get("reference") or data.get("tx_ref") or "")
+        charge_id = str(data.get("id") or "")
+        event_type = str(payload.get("type") or payload.get("event") or "unknown")
+        event_id = hashlib.sha256(request.body).hexdigest()
+
+        with transaction.atomic():
+            _, created = PaymentEvent.objects.get_or_create(
+                provider_event_id=event_id,
+                defaults={"event_type": event_type, "payload": {
+                    "reference": reference, "charge_id": charge_id, "status": str(data.get("status") or ""),
+                }},
+            )
+            if created:
+                queue_message(
+                    "payments.webhook.received", {"provider_event_id": event_id},
+                    reference=reference or charge_id or event_id,
+                )
+        return Response({"received": True}, status=200)
