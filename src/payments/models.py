@@ -118,3 +118,18 @@ class PaymentOutboxRecord(AbstractOutboxRecord):
     class Meta:
         db_table = "payments_broka_outbox"
         ordering = ("available_at", "created_at", "id")
+
+
+class AuthorizedPaymentMethod(models.Model):
+    """Provider-authenticated customer consent, provisioned by a trusted integration/admin."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="authorized_payment_methods")
+    provider_customer_id = models.CharField(max_length=128)
+    provider_payment_method_id = models.CharField(max_length=128, unique=True)
+    consent_reference = models.CharField(max_length=128)
+    verified_at = models.DateTimeField(null=True, blank=True)
+    is_active = models.BooleanField(default=False)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        indexes = [models.Index(fields=["owner", "is_active"])]

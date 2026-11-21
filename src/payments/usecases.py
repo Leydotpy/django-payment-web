@@ -5,7 +5,7 @@ from decimal import Decimal
 from django.db import transaction
 
 from .events import queue_message
-from .models import PaymentIntent, PaymentStatus
+from .models import AuthorizedPaymentMethod, PaymentIntent, PaymentStatus
 from .schemas import PaymentChargeCommand
 
 
@@ -24,6 +24,14 @@ def create_payment_charge(
         raise PaymentConflict("Invalid payment amount or currency.")
     if not reference.strip() or not customer_id or not payment_method_id:
         raise PaymentConflict("Reference, customer and payment method are required.")
+    if not (6 <= len(reference) <= 42) or not all(ch.isascii() and (ch.isalnum() or ch == "-") for ch in reference):
+        raise PaymentConflict("Reference must be 6–42 ASCII letters, digits or hyphens.")
+    if not AuthorizedPaymentMethod.objects.filter(
+        owner=owner, provider_customer_id=customer_id,
+        provider_payment_method_id=payment_method_id,
+        verified_at__isnull=False, is_active=True,
+    ).exists():
+        raise PaymentConflict("This payment method is not authorised for the requesting account.")
     with transaction.atomic():
         intent, created = PaymentIntent.objects.select_for_update().get_or_create(
             reference=reference,
