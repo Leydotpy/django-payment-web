@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from rest_framework import serializers
 from ..models import PaymentIntent
 
 
 class CreateChargeSerializer(serializers.Serializer):
     reference = serializers.CharField(max_length=128)
-    amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=0.01)
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal('0.01'))
     currency = serializers.RegexField(r"^[A-Za-z]{3}$")
     customer_id = serializers.CharField(max_length=128)
     payment_method_id = serializers.CharField(max_length=128)
